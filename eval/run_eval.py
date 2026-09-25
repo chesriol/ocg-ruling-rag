@@ -59,22 +59,24 @@ def load_done(path: Path):
     return done
 
 
-def run(configs, limit, official_only, quiet=False):
+def run(configs, limit, official_only, quiet=False, results_dir=None):
     from langchain_ollama import OllamaLLM
 
+    results_dir = Path(results_dir) if results_dir else RESULTS_DIR
     questions = load_goldens(limit=limit, official_only=official_only)
     retriever = rag_core.Retriever(
-        need_reranker="vector_rerank" in configs,
+        need_reranker=any(name in configs for name in ("vector_rerank", "vector_rerank_cards")),
         need_bm25="hybrid" in configs,
+        need_cards=any(name in configs for name in rag_core.CARD_MODES),
         verbose=not quiet,
     )
     if not quiet and retriever.reranker:
         print("rerank 设备：%s" % retriever.device)
     llm = OllamaLLM(model=rag_core.LLM_MODEL, temperature=0)
 
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    results_dir.mkdir(parents=True, exist_ok=True)
     for config in configs:
-        result_path = RESULTS_DIR / ("%s.jsonl" % config)
+        result_path = results_dir / ("%s.jsonl" % config)
         done = load_done(result_path)
         todo = [q for q in questions if q["id"] not in done]
         if not quiet:
@@ -138,8 +140,8 @@ def mcnemar_p(improved, worsened):
     return min(1.0, 2 * tail / (2 ** total))
 
 
-def load_records(config):
-    path = RESULTS_DIR / ("%s.jsonl" % config)
+def load_records(config, results_dir=None):
+    path = (Path(results_dir) if results_dir else RESULTS_DIR) / ("%s.jsonl" % config)
     if not path.exists():
         return []
     records = []
@@ -163,10 +165,11 @@ def golden_stems():
     return {q["id"]: q["stem"] for q in payload["questions"]}
 
 
-def report(configs):
-    ordered = [name for name in configs if load_records(name)]
+def report(configs, results_dir=None):
+    ordered = [name for name in configs if load_records(name, results_dir)]
     stems = golden_stems()
-    rows, by_config = {}, {name: {r["id"]: r for r in load_records(name)} for name in ordered}
+    rows, by_config = {}, {name: {r["id"]: r for r in load_records(name, results_dir)}
+                           for name in ordered}
     order_of = {name: index for index, name in enumerate(configs)}
     for config in ordered:
         records = list(by_config[config].values())
@@ -264,9 +267,11 @@ def report(configs):
             if worsened:
                 lines.append("  - 答错：%s" % "、".join("`%s`" % i for i in worsened[:12]))
 
-    REPORT_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    report_path = ((Path(results_dir) if results_dir else RESULTS_DIR).parent
+                   / "report.md" if results_dir else REPORT_PATH)
+    report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print("\n".join(lines))
-    print("\n已写出：%s" % REPORT_PATH)
+    print("\n已写出：%s" % report_path)
 
 
 if __name__ == "__main__":
@@ -276,11 +281,15 @@ if __name__ == "__main__":
     parser.add_argument("--all-questions", action="store_true",
                         help="包含非官方测试题（默认只跑官方题）")
     parser.add_argument("--report", action="store_true")
+    parser.add_argument("--results-dir", default=None,
+                        help="结果目录（默认 eval/results）。用于非破坏性试跑，"
+                             "例如重复跑同一配置来测量 LLM 推理噪声下限")
     args = parser.parse_args()
 
     chosen = [name.strip() for name in args.configs.split(",") if name.strip()]
     if args.report:
-        report(chosen)
+        report(chosen, args.results_dir)
     else:
-        run(chosen, args.limit or None, official_only=not args.all_questions)
-        report(chosen)
+        run(chosen, args.limit or None, official_only=not args.all_questions,
+            results_dir=args.results_dir)
+        report(chosen, args.results_dir)

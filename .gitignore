@@ -6,8 +6,10 @@ __pycache__/
 # 索引产物：可由 build_vector_store.py 从原始资料重建，不入库
 chroma_db/
 
-# 原始资料：体积大且第三方版权，按 README 说明自行下载
+# 原始资料：体积大且第三方内容，按 README 说明用脚本下载
 data/*.pdf
+data/*.cdb
+data/cards-manifest.json
 
 # IDE 与本地工具残留
 .idea/

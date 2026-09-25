@@ -50,14 +50,19 @@ RECALL_K = 20   # 粗召回条数
 FINAL_K = 3     # 默认送进提示词的条数
 DEEP_K = 8      # 加大上下文条数
 
-MODES = ("closed_book", "vector", "vector_deep", "vector_rerank", "hybrid")
+MODES = ("closed_book", "vector", "vector_deep", "vector_rerank", "hybrid",
+         "cards_only", "vector_rerank_cards")
 MODE_LABEL = {
     "closed_book": "闭卷（无检索·基线）",
     "vector": "纯向量 top3",
     "vector_deep": "纯向量 top8",
     "vector_rerank": "向量20 + rerank3",
     "hybrid": "BM25+向量融合 top3",
+    "cards_only": "仅卡片文本",
+    "vector_rerank_cards": "rerank3 + 卡片文本",
 }
+# 需要卡片库的配置：卡名精确匹配后把卡片文本作为额外证据注入
+CARD_MODES = ("cards_only", "vector_rerank_cards")
 
 # 两种任务的提示词。注意：开放式问答要求标注引用并允许拒答；
 # 单选题要求只输出一个字母，以便确定性评分（不需要 LLM 当裁判）。
@@ -184,9 +189,15 @@ class Retriever:
     """按配置检索。需要精排/BM25 时才加载对应组件，避免无谓的启动开销。"""
 
     def __init__(self, store=None, need_reranker: bool = False, need_bm25: bool = False,
-                 verbose: bool = False):
+                 need_cards: bool = False, verbose: bool = False):
         self.store = store if store is not None else build_store()
         self.reranker = Reranker() if need_reranker else None
+        self.cards = None
+        if need_cards:
+            from card_index import CardIndex
+            self.cards = CardIndex(verbose=verbose)
+            if verbose and not self.cards.available:
+                print("卡片库不可用：请先运行 python fetch_cards.py")
         self.bm25 = None
         if need_bm25:
             corpus = self.store.get(include=["documents", "metadatas"])
@@ -198,12 +209,25 @@ class Retriever:
     def device(self) -> str:
         return self.reranker.device if self.reranker else "未启用"
 
+    def card_documents(self, question: str) -> list:
+        """从问题里识别卡名，取出卡片文本作为证据。无卡片库或无匹配时返回空。"""
+        if self.cards is None or not self.cards.available:
+            return []
+        return self.cards.as_documents(self.cards.lookup(question))
+
     def retrieve(self, question: str, mode: str) -> Retrieved:
         started = time.perf_counter()
         if mode == "closed_book":
             return Retrieved(mode, [], 0.0)
 
-        if mode == "vector":
+        if mode == "cards_only":
+            documents = self.card_documents(question)
+        elif mode == "vector_rerank_cards":
+            # 卡片文本放在前面：题目就是围绕这些卡问的，优先让模型看到卡文本身
+            candidates = self.store.similarity_search(question, k=RECALL_K)
+            rules = [doc for doc, _ in self.reranker.rank(question, candidates)[:FINAL_K]]
+            documents = self.card_documents(question) + rules
+        elif mode == "vector":
             documents = self.store.similarity_search(question, k=FINAL_K)
         elif mode == "vector_deep":
             documents = self.store.similarity_search(question, k=DEEP_K)
@@ -253,15 +277,24 @@ def page_label_of(document) -> str:
     return "未标注页码"
 
 
+def document_label(document) -> str:
+    """证据来源标签。卡片文本与规则片段用不同前缀，让模型能区分两类依据。"""
+    if document.metadata.get("role") == "card-text":
+        return "卡片 %s" % document.metadata.get("card_name", "")
+    return "规则书 %s" % page_label_of(document)
+
+
 def build_context(documents) -> str:
     """把检索结果编号成提示词里的【参考资料】。
 
     编号是引用溯源的基础：模型被要求用 [n] 标注依据，用户可据此回查原页。
+    规则片段的格式与重构前逐字节一致（`[n] (规则书 p.xx)`），
+    因此加入卡片证据不会改变既有配置的提示词。
     """
     parts = []
     for order, document in enumerate(documents, start=1):
-        parts.append("[%d] (规则书 %s)\n%s" % (order, page_label_of(document),
-                                              document.page_content))
+        parts.append("[%d] (%s)\n%s" % (order, document_label(document),
+                                       document.page_content))
     return "\n\n".join(parts)
 
 
@@ -274,8 +307,14 @@ def build_qa_prompt(question: str, documents) -> str:
 
 
 def build_mc_prompt(mode: str, context: str, stem: str, options) -> str:
-    """单选题提示词。模板按检索配置选择（而非按上下文是否为空），与重构前一致。"""
-    template = PROMPT_MC_CLOSED_BOOK if mode == "closed_book" else PROMPT_MC_WITH_CONTEXT
+    """单选题提示词。
+
+    模板选择：闭卷配置、或本次一段资料都没取到时，用无资料模板 ——
+    否则会渲染出一个空的【参考资料】区块，既没意义也不公平。
+    既有配置永远能取到资料，所以这条规则不改变它们的提示词。
+    """
+    template = (PROMPT_MC_CLOSED_BOOK if mode == "closed_book" or not context
+                else PROMPT_MC_WITH_CONTEXT)
     return template.format(context=context, stem=stem, options=format_options(options))
 
 

@@ -62,8 +62,9 @@ def main():
 
     mode = args.mode or ("vector" if args.no_rerank else "vector_rerank")
     retriever = rag_core.Retriever(
-        need_reranker=(mode == "vector_rerank"),
+        need_reranker=mode in ("vector_rerank", "vector_rerank_cards"),
         need_bm25=(mode == "hybrid"),
+        need_cards=mode in rag_core.CARD_MODES,
     )
     llm = OllamaLLM(model=rag_core.LLM_MODEL, temperature=0)
 
