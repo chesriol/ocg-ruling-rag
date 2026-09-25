@@ -65,7 +65,7 @@ def run(configs, limit, official_only, quiet=False, results_dir=None):
     results_dir = Path(results_dir) if results_dir else RESULTS_DIR
     questions = load_goldens(limit=limit, official_only=official_only)
     retriever = rag_core.Retriever(
-        need_reranker=any(name in configs for name in ("vector_rerank", "vector_rerank_cards")),
+        need_reranker=any(name in configs for name in rag_core.RERANK_MODES),
         need_bm25="hybrid" in configs,
         need_cards=any(name in configs for name in rag_core.CARD_MODES),
         verbose=not quiet,

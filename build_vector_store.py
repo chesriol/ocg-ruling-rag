@@ -31,6 +31,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 ROOT = Path(__file__).resolve().parent
 PDF_PATH = ROOT / "data" / "ocg-rule-readthedocs-io-zh-cn-latest.pdf"
 NOTE_PATH = ROOT / "data" / "yugioh_knowledge.txt"
+QA_PATH = ROOT / "data" / "official-qa.jsonl"
 GOLDENS_PATH = ROOT / "eval" / "goldens.json"
 DB_DIR = ROOT / "chroma_db"
 MANIFEST_PATH = DB_DIR / "manifest.json"
@@ -41,7 +42,7 @@ EMBED_MODEL = "BAAI/bge-small-zh-v1.5"
 # 读取端（query_rag.py / eval/run_eval.py）必须传同一个名字。
 
 # 只保留真正可作规则依据的角色；其余在建库阶段丢弃
-KEPT_ROLES = {"rule-doc", "rule-note"}
+KEPT_ROLES = {"rule-doc", "rule-note", "official-qa"}
 ROMAN_PAGE_LABELS = {"i", "ii", "iii", "iv", "v"}
 
 # 考卷起始页；优先从 eval/goldens.json 推导，避免两处硬编码不一致
@@ -145,6 +146,48 @@ def clean_page_text(text: str, page_label: str):
     return RE_BLANK_RUN.sub("\n\n", text).strip(), header_count[0], footer_count[0]
 
 
+def qa_splitter() -> RecursiveCharacterTextSplitter:
+    """官方 Q&A 用更大的块：一条问答通常 800 字符左右，尽量整条保留。"""
+    return RecursiveCharacterTextSplitter(
+        chunk_size=1200,
+        chunk_overlap=150,
+        length_function=len,
+        separators=["\n\n", "\n", "。", "！", "？", "；", "，", " ", ""],
+    )
+
+
+def load_qa_documents():
+    """读取官方 Q&A 语料（fetch_qa.py 产出）。
+
+    这些记录不适合走 PDF 那套切片策略：它们是"一条一问一答"的独立单元，
+    切碎会破坏问答对应关系，所以用更大的块长单独处理。
+    """
+    if not QA_PATH.exists():
+        print("未找到官方 Q&A 语料（可运行 python fetch_qa.py 生成）：%s" % QA_PATH.name)
+        return []
+    records = []
+    with QA_PATH.open(encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            item = json.loads(line)
+            question = (item.get("question") or "").strip()
+            answer = (item.get("answer") or "").strip()
+            if not question and not answer:
+                continue
+            records.append(Document(
+                page_content="%s\n%s" % (question, answer),
+                metadata={
+                    "role": "official-qa",
+                    "qa_id": str(item.get("qa_id", "")),
+                    "source": QA_PATH.name,
+                    "source_url": item.get("source", ""),
+                    "cards": "、".join(item.get("cards") or [])[:200],
+                }))
+    print("读取官方 Q&A：%d 条（本地化：日文正文 + 中文卡名）" % len(records))
+    return records
+
+
 def load_chunks():
     if not PDF_PATH.exists():
         raise SystemExit("找不到规则书 PDF：%s" % PDF_PATH)
@@ -185,6 +228,12 @@ def build():
             continue
         kept.append((chunk, source, page_label, role))
 
+    # 官方 Q&A 以整条为单位入库（角色固定，不经 PDF 的角色判定）
+    qa_documents = load_qa_documents()
+    qa_chunks = qa_splitter().split_documents(qa_documents) if qa_documents else []
+    for chunk in qa_chunks:
+        kept.append((chunk, QA_PATH.name, "", "official-qa"))
+
     print("切分片段 %d → 入库 %d，剔除 %s" % (len(chunks), len(kept), dropped))
     if not kept:
         raise SystemExit("没有可入库的片段，请检查数据与角色规则")
@@ -216,7 +265,8 @@ def build():
         "built_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "collection": COLLECTION,
         "embedding_model": EMBED_MODEL,
-        "chunking": {"chunk_size": 1000, "chunk_overlap": 200},
+        "chunking": {"chunk_size": 1000, "chunk_overlap": 200,
+                     "official_qa": {"chunk_size": 1200, "chunk_overlap": 150}},
         "cleaning": {
             **cleaning,
             "note": "页眉固定为「ocg-rule Documentation」；页脚形如「4.4. 战斗阶段流程 144」，"
@@ -238,6 +288,15 @@ def build():
     if NOTE_PATH.exists():
         manifest["sources"][NOTE_PATH.name] = {
             "sha256": sha256_file(NOTE_PATH), "bytes": NOTE_PATH.stat().st_size}
+    if QA_PATH.exists():
+        manifest["sources"][QA_PATH.name] = {
+            "sha256": sha256_file(QA_PATH), "bytes": QA_PATH.stat().st_size}
+        manifest["official_qa"] = {
+            "records": len(qa_documents),
+            "chunks": len(qa_chunks),
+            "language": "日文正文 + 中文卡名（官方库无中文 Q&A，实测确认）",
+            "sampling_note": "由 fetch_qa.py 对卡表等距抽样取得，规则与评测集无关",
+        }
     MANIFEST_PATH.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print("入库完成：%s" % json.dumps(role_counts, ensure_ascii=False))

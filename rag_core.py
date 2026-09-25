@@ -51,7 +51,7 @@ FINAL_K = 3     # 默认送进提示词的条数
 DEEP_K = 8      # 加大上下文条数
 
 MODES = ("closed_book", "vector", "vector_deep", "vector_rerank", "hybrid",
-         "cards_only", "vector_rerank_cards")
+         "cards_only", "vector_rerank_cards", "qa_only", "vector_rerank_cards_qa")
 MODE_LABEL = {
     "closed_book": "闭卷（无检索·基线）",
     "vector": "纯向量 top3",
@@ -60,9 +60,22 @@ MODE_LABEL = {
     "hybrid": "BM25+向量融合 top3",
     "cards_only": "仅卡片文本",
     "vector_rerank_cards": "rerank3 + 卡片文本",
+    "qa_only": "仅官方Q&A",
+    "vector_rerank_cards_qa": "rerank3 + 卡片 + 官方Q&A",
 }
+# 需要精排的配置
+RERANK_MODES = ("vector_rerank", "vector_rerank_cards", "vector_rerank_cards_qa")
 # 需要卡片库的配置：卡名精确匹配后把卡片文本作为额外证据注入
-CARD_MODES = ("cards_only", "vector_rerank_cards")
+CARD_MODES = ("cards_only", "vector_rerank_cards", "vector_rerank_cards_qa")
+# 需要官方 Q&A 的配置
+QA_MODES = ("qa_only", "vector_rerank_cards_qa")
+
+# 角色过滤：既有配置只看规则片段，加入 Q&A/卡片后结果不受影响 ——
+# 这是"新增语料"和"改动既有配置"之间的隔离带。
+RULE_ROLES = ("rule-doc", "rule-note")
+QA_ROLES = ("official-qa",)
+RULE_FILTER = {"role": {"$in": list(RULE_ROLES)}}
+QA_FILTER = {"role": {"$in": list(QA_ROLES)}}
 
 # 两种任务的提示词。注意：开放式问答要求标注引用并允许拒答；
 # 单选题要求只输出一个字母，以便确定性评分（不需要 LLM 当裁判）。
@@ -201,9 +214,19 @@ class Retriever:
         self.bm25 = None
         if need_bm25:
             corpus = self.store.get(include=["documents", "metadatas"])
-            self.bm25 = Bm25Index(corpus["documents"], corpus["metadatas"])
+            # 只用规则片段建 BM25：保证既有 hybrid 配置的结果不因新增语料而改变
+            keep = [index for index, meta in enumerate(corpus["metadatas"])
+                    if (meta or {}).get("role") in RULE_ROLES]
+            self.bm25 = Bm25Index([corpus["documents"][i] for i in keep],
+                                  [corpus["metadatas"][i] for i in keep])
             if verbose:
-                print("BM25 语料：%d 条" % len(corpus["documents"]))
+                print("BM25 语料：%d 条（仅规则片段）" % len(keep))
+
+    def _search_rules(self, question: str, top_k: int):
+        return self.store.similarity_search(question, k=top_k, filter=RULE_FILTER)
+
+    def _search_qa(self, question: str, top_k: int):
+        return self.store.similarity_search(question, k=top_k, filter=QA_FILTER)
 
     @property
     def device(self) -> str:
@@ -222,17 +245,25 @@ class Retriever:
 
         if mode == "cards_only":
             documents = self.card_documents(question)
+        elif mode == "qa_only":
+            documents = self._search_qa(question, FINAL_K)
         elif mode == "vector_rerank_cards":
             # 卡片文本放在前面：题目就是围绕这些卡问的，优先让模型看到卡文本身
-            candidates = self.store.similarity_search(question, k=RECALL_K)
+            candidates = self._search_rules(question, RECALL_K)
             rules = [doc for doc, _ in self.reranker.rank(question, candidates)[:FINAL_K]]
             documents = self.card_documents(question) + rules
+        elif mode == "vector_rerank_cards_qa":
+            # 三类证据：卡片文本 → 规则片段 → 官方 Q&A
+            candidates = self._search_rules(question, RECALL_K)
+            rules = [doc for doc, _ in self.reranker.rank(question, candidates)[:FINAL_K]]
+            documents = (self.card_documents(question) + rules
+                         + self._search_qa(question, FINAL_K))
         elif mode == "vector":
-            documents = self.store.similarity_search(question, k=FINAL_K)
+            documents = self._search_rules(question, FINAL_K)
         elif mode == "vector_deep":
-            documents = self.store.similarity_search(question, k=DEEP_K)
+            documents = self._search_rules(question, DEEP_K)
         elif mode == "vector_rerank":
-            candidates = self.store.similarity_search(question, k=RECALL_K)
+            candidates = self._search_rules(question, RECALL_K)
             documents = [doc for doc, _ in self.reranker.rank(question, candidates)[:FINAL_K]]
         elif mode == "hybrid":
             documents = self._hybrid(question)
@@ -247,7 +278,7 @@ class Retriever:
         交替（round-robin）而不是加权求和：两路分数不在同一量纲上，直接相加需要标定，
         交替融合无参数、可复现。
         """
-        dense = self.store.similarity_search(question, k=RECALL_K)
+        dense = self._search_rules(question, RECALL_K)
         lexical = self.bm25.search(question, RECALL_K)
         merged, seen = [], set()
         for position in range(RECALL_K):
@@ -278,9 +309,12 @@ def page_label_of(document) -> str:
 
 
 def document_label(document) -> str:
-    """证据来源标签。卡片文本与规则片段用不同前缀，让模型能区分两类依据。"""
-    if document.metadata.get("role") == "card-text":
+    """证据来源标签。卡片 / 官方 Q&A / 规则片段用不同前缀，让模型能区分依据类型。"""
+    role = document.metadata.get("role")
+    if role == "card-text":
         return "卡片 %s" % document.metadata.get("card_name", "")
+    if role == "official-qa":
+        return "官方Q&A #%s" % document.metadata.get("qa_id", "")
     return "规则书 %s" % page_label_of(document)
 
 
