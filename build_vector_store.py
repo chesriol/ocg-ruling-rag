@@ -24,6 +24,7 @@ from pathlib import Path
 
 from langchain_chroma import Chroma
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
+from langchain_core.documents import Document
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
@@ -108,23 +109,69 @@ def splitter() -> RecursiveCharacterTextSplitter:
     )
 
 
+# PDF 每页都带页眉「ocg-rule Documentation」和页脚「<章节号> <标题> <页码>」。
+# 不清掉有两个实际害处：样板文字会被编码进向量，而且模型会把章节标题当正文引用
+# （实测它照抄过「[4.4. 战斗阶段流程 144]」）。
+RE_PAGE_HEADER = re.compile(r"^[ \t]*ocg-rule Documentation[ \t]*$", re.M)
+RE_PAGE_FOOTER = re.compile(r"^[ \t]*\d+(?:\.\d+)*\.?[ \t]+\S.*?[ \t](\d{1,3})[ \t]*$", re.M)
+RE_BLANK_RUN = re.compile(r"\n{3,}")
+
+
+def clean_page_text(text: str, page_label: str):
+    """去掉本页的页眉与页脚，返回 (清洗后文本, 删掉页眉数, 删掉页脚数)。
+
+    关键：页脚**只在行尾数字恰好等于本页 page_label 时才删**。
+    实测 349 页共 343 处页脚，其中 337 处行尾数字与本页 page_label 完全相等，
+    其余 6 处在罗马数字前言页（那几页整体不会入索引）。用页码做精确匹配，
+    就不会误删"以数字开头、以数字结尾"的正文行 —— 这是纯正则做不到的。
+    """
+    header_count = [0]
+    footer_count = [0]
+
+    def drop_header(_match):
+        header_count[0] += 1
+        return ""
+
+    text = RE_PAGE_HEADER.sub(drop_header, text)
+
+    if page_label.isdigit():
+        def drop_footer(match):
+            if match.group(1) != page_label:
+                return match.group(0)
+            footer_count[0] += 1
+            return ""
+        text = RE_PAGE_FOOTER.sub(drop_footer, text)
+
+    return RE_BLANK_RUN.sub("\n\n", text).strip(), header_count[0], footer_count[0]
+
+
 def load_chunks():
     if not PDF_PATH.exists():
         raise SystemExit("找不到规则书 PDF：%s" % PDF_PATH)
 
-    documents = PyPDFLoader(str(PDF_PATH)).load()
-    print("读取 PDF：%s（%d 页）" % (PDF_PATH.name, len(documents)))
+    pages = PyPDFLoader(str(PDF_PATH)).load()
+    print("读取 PDF：%s（%d 页）" % (PDF_PATH.name, len(pages)))
+
+    stats = {"headers_removed": 0, "footers_removed": 0}
+    documents = []
+    for page in pages:
+        label = str(page.metadata.get("page_label") or "")
+        cleaned, headers, footers = clean_page_text(page.page_content, label)
+        stats["headers_removed"] += headers
+        stats["footers_removed"] += footers
+        documents.append(Document(page_content=cleaned, metadata=dict(page.metadata)))
+    print("清洗页眉 %d 处、页脚 %d 处" % (stats["headers_removed"], stats["footers_removed"]))
 
     chunks = splitter().split_documents(documents)
     if NOTE_PATH.exists():
         chunks += splitter().split_documents(TextLoader(str(NOTE_PATH), encoding="utf-8").load())
         print("读取补充笔记：%s" % NOTE_PATH.name)
-    return chunks
+    return chunks, stats
 
 
 def build():
     test_page_min = chapter_six_start_page()
-    chunks = load_chunks()
+    chunks, cleaning = load_chunks()
 
     kept, dropped = [], {"toc": 0, "site-info": 0, "rule-test": 0}
     for chunk in chunks:
@@ -170,6 +217,11 @@ def build():
         "collection": COLLECTION,
         "embedding_model": EMBED_MODEL,
         "chunking": {"chunk_size": 1000, "chunk_overlap": 200},
+        "cleaning": {
+            **cleaning,
+            "note": "页眉固定为「ocg-rule Documentation」；页脚形如「4.4. 战斗阶段流程 144」，"
+                    "仅在行尾数字等于本页 page_label 时删除，避免误删正文。",
+        },
         "sources": {
             PDF_PATH.name: {"sha256": sha256_file(PDF_PATH), "bytes": PDF_PATH.stat().st_size},
         },

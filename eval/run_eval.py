@@ -256,7 +256,7 @@ def report(configs):
             probability = mcnemar_p(improved, worsened)
             verdict = "显著" if probability < 0.05 else "不显著"
             lines += ["- **%s**：检索后答对 %d 道，检索后答错 %d 道，"
-                      "McNemar p=%.4f（%s）" % (
+                      "McNemar p=%.3f（%s）" % (
                           label.get(config, config), len(improved), len(worsened),
                           probability, verdict)]
             if improved:
