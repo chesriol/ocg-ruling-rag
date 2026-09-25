@@ -283,3 +283,77 @@ def extract_choice(text: str):
     """从模型输出里取选项字母；取不到返回 None（计入解析失败而非算错）。"""
     match = re.search(r"[A-E]", (text or "").upper())
     return match.group(0) if match else None
+
+
+# ------------------------------------------------------------------ 引用校验
+
+# 方括号里只认编号，最长 40 字符（避免把 [某段很长的说明] 误当引用）
+_CITATION_BLOCK = re.compile(r"\[([^\[\]]{1,40})\]")
+_CITATION_PREFIX = re.compile(r"^(?:编号|来源|资料|证据|引用)[:：]?\s*")
+# 括号内容必须**只有数字和分隔符**才算引用。
+# 反例：模型会照着资料原文引用章节标题「[4.4. 战斗阶段流程 141]」，
+# 若按空白切分就会把页码 141 误判成引用编号 —— 实测踩过这个坑。
+_CITATION_BODY = re.compile(r"^[\d,，、;；\s]+$")
+
+
+@dataclass(frozen=True)
+class CitationReport:
+    """模型答案里的引用编号，与本次实际提供的资料是否对得上。
+
+    为什么必须校验：模型会编造编号。实测问「灰流丽能否在伤害步骤发动」时，
+    答案写了「根据参考资料 [1] 和 [4]」，而提示词里只给了 3 段资料 ——
+    用户看到编号会以为有据可查，实际指向空气。
+
+    这里刻意**只做校验、不修改答案**：把越界编号删掉并不会让那句话变正确，
+    显式告诉用户"这处依据无法核实"才是诚实的处理。
+    """
+
+    evidence_count: int
+    cited: tuple        # 答案里出现的所有编号
+    valid: tuple        # 落在 [1, evidence_count] 内的
+    invalid: tuple      # 越界编号
+    unused: tuple       # 提供了但模型没引用的
+
+    @property
+    def ok(self) -> bool:
+        return not self.invalid
+
+    @property
+    def has_citation(self) -> bool:
+        return bool(self.cited)
+
+    def warning(self) -> str:
+        lines = []
+        if self.invalid:
+            lines.append(
+                "模型引用了不存在的资料编号 %s（本次只提供了 %d 段资料），这些依据无法核实"
+                % ("、".join("[%d]" % number for number in self.invalid), self.evidence_count))
+        if not self.cited and self.evidence_count:
+            lines.append("答案未标注任何引用编号，依据无法核对")
+        return "\n".join(lines)
+
+
+def extract_citations(answer: str):
+    """提取引用编号，兼容 [1] / [编号：1] / [1,2] / [1、3] 等写法。
+
+    只接受"括号内仅有数字与分隔符"的写法；引用正文（如章节标题
+    「[4.4. 战斗阶段流程 141]」）不会被误判成编号。
+    """
+    numbers = set()
+    for block in _CITATION_BLOCK.findall(answer or ""):
+        body = _CITATION_PREFIX.sub("", block.strip())
+        if not _CITATION_BODY.match(body):
+            continue
+        for token in re.split(r"[,，、;；\s]+", body):
+            if token.isdigit():
+                numbers.add(int(token))
+    return numbers
+
+
+def check_citations(answer: str, evidence_count: int) -> CitationReport:
+    """校验答案引用。`evidence_count` 是本次真正提供给模型的资料段数。"""
+    cited = extract_citations(answer)
+    valid = tuple(sorted(number for number in cited if 1 <= number <= evidence_count))
+    invalid = tuple(sorted(number for number in cited if not 1 <= number <= evidence_count))
+    unused = tuple(number for number in range(1, evidence_count + 1) if number not in cited)
+    return CitationReport(evidence_count, tuple(sorted(cited)), valid, invalid, unused)

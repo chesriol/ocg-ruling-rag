@@ -21,16 +21,36 @@ import rag_core
 
 
 def answer(retriever, llm, question, mode):
+    """跑一轮问答，返回 (检索结果, 生成耗时毫秒, 答案全文)。
+
+    答案全文要留下来做引用校验 —— 流式输出时只打印，不再丢弃。
+    """
     result = retriever.retrieve(question, mode)
     if not result.documents:
         print("没有检索到相关资料。")
-        return result, 0.0
+        return result, 0.0, ""
     prompt = rag_core.build_qa_prompt(question, result.documents)
     started = time.perf_counter()
+    pieces = []
     for piece in llm.stream(prompt):           # 流式输出，避免长时间"思考中..."
+        pieces.append(piece)
         sys.stdout.write(piece)
         sys.stdout.flush()
-    return result, (time.perf_counter() - started) * 1000
+    return result, (time.perf_counter() - started) * 1000, "".join(pieces)
+
+
+def report_evidence(result, citation, generation_ms):
+    """打印依据清单：标出哪几段被真正引用，并对编造的编号给出警告。"""
+    print("\n\n依据：")
+    for order, document in enumerate(result.documents, start=1):
+        used = order in citation.cited
+        print("  [%d] %s 规则书 %s%s" % (
+            order, "✓" if used else " ", rag_core.page_label_of(document),
+            "" if used else "   （模型未引用）"))
+    print("耗时：检索 %.0f ms / 生成 %.0f ms" % (result.elapsed_ms, generation_ms))
+    warning = citation.warning()
+    for line in warning.splitlines():
+        print("⚠  %s" % line)
 
 
 def main():
@@ -60,12 +80,12 @@ def main():
         if question.lower() == "q":
             break
         print("AI答：", end="")
-        result, generation_ms = answer(retriever, llm, question, mode)
+        result, generation_ms, answer_text = answer(retriever, llm, question, mode)
         if result.documents:
-            print("\n\n依据：")
-            for order, document in enumerate(result.documents, start=1):
-                print("  [%d] 规则书 %s" % (order, rag_core.page_label_of(document)))
-        print("耗时：检索 %.0f ms / 生成 %.0f ms" % (result.elapsed_ms, generation_ms))
+            citation = rag_core.check_citations(answer_text, len(result.documents))
+            report_evidence(result, citation, generation_ms)
+        else:
+            print("耗时：检索 %.0f ms / 生成 %.0f ms" % (result.elapsed_ms, generation_ms))
 
 
 if __name__ == "__main__":
