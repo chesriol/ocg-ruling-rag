@@ -1,0 +1,26 @@
+# 依赖清单（在 conda 环境 rag_project 下用 Python 3.10 验证）
+#
+# torch 必须装 CUDA 版，否则 reranker 只能跑 CPU（实测每问 50 秒以上）。
+# 下面两行让 pip 从 PyTorch 官方索引取 torch，其余包仍走 PyPI：
+--extra-index-url https://download.pytorch.org/whl/cu130
+
+torch==2.13.0+cu130
+transformers==5.14.1
+sentence-transformers==5.6.1
+numpy==2.2.6
+
+langchain==1.3.14
+langchain-core==1.5.3
+langchain-community==0.4.2
+langchain-chroma==1.1.0
+langchain-huggingface==1.2.2
+langchain-ollama==1.1.0
+langchain-text-splitters==1.1.2
+chromadb==1.5.9
+pypdf==6.14.2
+
+# 说明：
+#   * 各 CUDA 版本对应的 torch 轮子见 https://download.pytorch.org/whl/
+#     把上面的 cu130 换成 cu126 / cu124 即可，torch 版本号要跟着改。
+#   * langchain-community 已被官方标记为 sunset，PyPDFLoader 会打 DeprecationWarning，
+#     后续可迁移到独立集成包，功能不受影响。

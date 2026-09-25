@@ -1,0 +1,8 @@
+# 统一换行符，避免跨平台协作时整个仓库显示为已修改
+* text=auto eol=lf
+
+# 数据与二进制产物按原样处理
+*.pdf binary
+*.f32 binary
+*.sqlite3 binary
+*.jsonl text eol=lf
