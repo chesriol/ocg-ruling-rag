@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
-"""三配置对比评测：闭卷 / 纯向量 / 向量+rerank / BM25+向量 混合。
+"""多配置对比评测：闭卷 / 纯向量 / 加深上下文 / 精排 / BM25+向量 混合。
 
 设计与取舍：
-  * 只评测 goldens.json 里 gradeable=true 的单选题（官方题优先），不用 LLM 当裁判，
-    准确率是确定性的数字。
+  * 只评测 goldens.json 里 gradeable 的单选题（默认只取官方题），不用 LLM 当裁判，
+    准确率是确定性数字。
   * 结果按题增量写入 eval/results/<config>.jsonl，可中断续跑（长跑必备）。
-  * 第 6 章考卷已在建库阶段从索引里剔除，所以这里不存在"检索到答案原文"的泄漏。
+  * 第 6 章考卷已在建库阶段从索引里剔除，因此不存在"检索到答案原文"的泄漏。
+  * **检索与提示词来自 rag_core.py**，与 query_rag.py 共用同一份实现，
+    保证评测里测的就是命令行里跑的。
 
 用法：
   python eval/run_eval.py --limit 10                # 冒烟测试
@@ -15,193 +17,24 @@
 from __future__ import annotations
 
 import argparse
-import io
 import json
 import math
-import re
+import sys
 import time
-from collections import Counter, defaultdict
+from collections import defaultdict
 from pathlib import Path
 
-from langchain_core.documents import Document
-
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))          # 让子目录里的脚本能 import rag_core
+
+import rag_core                        # noqa: E402  （必须在 sys.path 调整之后导入）
+
 EVAL_DIR = Path(__file__).resolve().parent
 GOLDENS_PATH = EVAL_DIR / "goldens.json"
 RESULTS_DIR = EVAL_DIR / "results"
 REPORT_PATH = EVAL_DIR / "report.md"
 
-DB_DIR = str(ROOT / "chroma_db")
-COLLECTION = "ocg-rule"
-EMBED_MODEL = "BAAI/bge-small-zh-v1.5"
-RERANK_MODEL = "BAAI/bge-reranker-v2-m3"
-LLM_MODEL = "qwen2.5:7b"
-
-RECALL_K = 20   # 粗召回条数
-FINAL_K = 3     # 默认送进提示词的条数
-DEEP_K = 8      # 加大上下文条数，用于验证"片段给少了"这一假设
-ALL_CONFIGS = ["closed_book", "vector", "vector_deep", "vector_rerank", "hybrid"]
-
-PROMPT_WITH_CONTEXT = """你是游戏王 OCG 规则裁判。请仅依据下面的【参考资料】判断这道单项选择题的答案。
-资料可能不完整，但你必须在 A/B/C/D/E 中选出一个最可能的答案。
-
-【参考资料】
-{context}
-
-【题目】
-{stem}
-{options}
-
-只输出一个选项字母（A/B/C/D/E），不要输出任何解释。"""
-
-PROMPT_CLOSED_BOOK = """你是游戏王 OCG 规则裁判。请判断这道单项选择题的答案。
-
-【题目】
-{stem}
-{options}
-
-只输出一个选项字母（A/B/C/D/E），不要输出任何解释。"""
-
-
-# ---------------------------------------------------------------- 检索组件
-
-def format_options(question: dict) -> str:
-    return "\n".join("%s. %s" % (key, question["options"][key])
-                     for key in sorted(question["options"]))
-
-
-def build_bm25(documents):
-    """字符二元组 BM25：中文无需分词依赖，够用且可复现。"""
-    def grams(text: str):
-        text = re.sub(r"\s+", "", text)
-        return [text[i:i + 2] for i in range(max(len(text) - 1, 1))]
-
-    doc_grams = [grams(text) for text in documents]
-    doc_len = [len(item) for item in doc_grams]
-    average_len = sum(doc_len) / max(len(doc_len), 1)
-    document_frequency = Counter()
-    for item in doc_grams:
-        document_frequency.update(set(item))
-    total = len(doc_grams)
-
-    def score(query: str, index: int, k1: float = 1.5, b: float = 0.75):
-        counts = Counter(doc_grams[index])
-        value = 0.0
-        for gram in set(grams(query)):
-            frequency = counts.get(gram, 0)
-            if not frequency:
-                continue
-            idf = math.log(1 + (total - document_frequency[gram] + 0.5)
-                           / (document_frequency[gram] + 0.5))
-            denominator = frequency + k1 * (1 - b + b * doc_len[index] / average_len)
-            value += idf * frequency * (k1 + 1) / denominator
-        return value
-
-    return score
-
-
-def vector_search(store, question, top_k):
-    return store.similarity_search(question, k=top_k)
-
-
-def lexical_search(documents, metadatas, score, question, top_k):
-    ranked = sorted(range(len(documents)), key=lambda i: -score(question, i))[:top_k]
-    # 统一返回 Document，避免与向量检索的返回类型不一致（混合配置要合并两个队列）
-    return [Document(page_content=documents[i], metadata=dict(metadatas[i] or {}))
-            for i in ranked]
-
-
-def bm25_pick(question, documents, metadatas, score, top_k=RECALL_K):
-    return lexical_search(documents, metadatas, score, question, top_k)
-
-
-# ---------------------------------------------------------------- 各配置的上下文
-
-def context_for(config, question_text, store, bm25_state, reranker):
-    """返回 (context 文本, 检索耗时毫秒, 命中的 chunk 数)。"""
-    started = time.perf_counter()
-    if config == "closed_book":
-        return "", 0.0, 0
-
-    if config == "vector":
-        docs = vector_search(store, question_text, FINAL_K)
-        chunks = docs
-    elif config == "vector_deep":
-        chunks = vector_search(store, question_text, DEEP_K)
-    elif config == "vector_rerank":
-        candidates = vector_search(store, question_text, RECALL_K)
-        chunks = reranker(question_text, candidates, FINAL_K)
-    elif config == "hybrid":
-        documents, metadatas, score = bm25_state
-        dense = vector_search(store, question_text, RECALL_K)
-        lexical = bm25_pick(question_text, documents, metadatas, score, RECALL_K)
-        merged, seen = [], set()
-        for position in range(RECALL_K):
-            for queue in (lexical, dense):
-                if position >= len(queue):
-                    continue
-                item = queue[position]
-                key = item.metadata.get("chunk_id") or item.page_content[:64]
-                if key in seen:
-                    continue
-                seen.add(key)
-                merged.append(item)
-                if len(merged) >= FINAL_K:
-                    break
-            if len(merged) >= FINAL_K:
-                break
-        chunks = merged
-    else:
-        raise ValueError("未知配置：%s" % config)
-
-    parts = []
-    for order, doc in enumerate(chunks, start=1):
-        label = doc.metadata.get("page_label")
-        if not label:
-            label = "补充笔记" if doc.metadata.get("role") == "rule-note" else "未标注页码"
-        else:
-            label = "p.%s" % label
-        parts.append("[%d] (规则书 %s)\n%s" % (order, label, doc.page_content))
-    return "\n\n".join(parts), (time.perf_counter() - started) * 1000, len(chunks)
-
-
-# ---------------------------------------------------------------- 主流程
-
-def load_reranker():
-    import torch
-    from transformers import AutoTokenizer, AutoModelForSequenceClassification
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    tokenizer = AutoTokenizer.from_pretrained(RERANK_MODEL)
-    model = AutoModelForSequenceClassification.from_pretrained(RERANK_MODEL)
-    model.eval()
-    if device == "cuda":
-        model = model.half()
-    model = model.to(device)
-
-    def rerank(question, candidates, final_k):
-        if not candidates:
-            return []
-        pairs = [[question, doc.page_content] for doc in candidates]
-        with torch.no_grad():
-            inputs = tokenizer(pairs, padding=True, truncation=True,
-                               return_tensors="pt", max_length=512).to(device)
-            scores = model(**inputs, return_dict=True).logits.view(-1).float()
-        order = sorted(zip(candidates, scores.tolist()), key=lambda item: -item[1])
-        return [doc for doc, _ in order[:final_k]]
-
-    rerank.device = device
-    return rerank
-
-
-def load_store():
-    from langchain_huggingface import HuggingFaceEmbeddings
-    from langchain_chroma import Chroma
-
-    embeddings = HuggingFaceEmbeddings(model_name=EMBED_MODEL)
-    store = Chroma(persist_directory=DB_DIR, embedding_function=embeddings,
-                   collection_name=COLLECTION)
-    return store
+ALL_CONFIGS = list(rag_core.MODES)
 
 
 def load_goldens(limit=None, official_only=True):
@@ -226,29 +59,18 @@ def load_done(path: Path):
     return done
 
 
-def extract_letter(text: str):
-    match = re.search(r"[A-E]", text.upper())
-    return match.group(0) if match else None
-
-
 def run(configs, limit, official_only, quiet=False):
     from langchain_ollama import OllamaLLM
 
     questions = load_goldens(limit=limit, official_only=official_only)
-    store = load_store()
-    llm = OllamaLLM(model=LLM_MODEL, temperature=0)
-
-    needs_reranker = "vector_rerank" in configs
-    reranker = load_reranker() if needs_reranker else None
-    if needs_reranker and not quiet:
-        print("rerank 设备：%s" % reranker.device)
-
-    bm25_state = None
-    if "hybrid" in configs:
-        raw = store.get(include=["documents", "metadatas"])
-        bm25_state = (raw["documents"], raw["metadatas"], build_bm25(raw["documents"]))
-        if not quiet:
-            print("BM25 语料：%d 条" % len(raw["documents"]))
+    retriever = rag_core.Retriever(
+        need_reranker="vector_rerank" in configs,
+        need_bm25="hybrid" in configs,
+        verbose=not quiet,
+    )
+    if not quiet and retriever.reranker:
+        print("rerank 设备：%s" % retriever.device)
+    llm = OllamaLLM(model=rag_core.LLM_MODEL, temperature=0)
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     for config in configs:
@@ -260,11 +82,10 @@ def run(configs, limit, official_only, quiet=False):
         with result_path.open("a", encoding="utf-8") as handle:
             for order, question in enumerate(todo, start=1):
                 question_text = question["stem"]
-                context, retrieval_ms, chunk_count = context_for(
-                    config, question_text, store, bm25_state, reranker)
-                template = PROMPT_CLOSED_BOOK if config == "closed_book" else PROMPT_WITH_CONTEXT
-                prompt = template.format(context=context, stem=question_text,
-                                         options=format_options(question))
+                retrieved = retriever.retrieve(question_text, config)
+                prompt = rag_core.build_mc_prompt(
+                    config, rag_core.build_context(retrieved.documents),
+                    question_text, question["options"])
                 started = time.perf_counter()
                 try:
                     raw_answer = llm.invoke(prompt)
@@ -273,7 +94,7 @@ def run(configs, limit, official_only, quiet=False):
                     raw_answer, error = "", "%s: %s" % (type(exc).__name__, exc)
                 generation_ms = (time.perf_counter() - started) * 1000
 
-                predicted = extract_letter(raw_answer or "")
+                predicted = rag_core.extract_choice(raw_answer or "")
                 record = {
                     "id": question["id"],
                     "config": config,
@@ -282,9 +103,9 @@ def run(configs, limit, official_only, quiet=False):
                     "gold": question["answer"],
                     "predicted": predicted,
                     "correct": predicted == question["answer"],
-                    "retrieval_ms": round(retrieval_ms, 1),
+                    "retrieval_ms": round(retrieved.elapsed_ms, 1),
                     "generation_ms": round(generation_ms, 1),
-                    "context_chunks": chunk_count,
+                    "context_chunks": len(retrieved.documents),
                     "raw_answer": (raw_answer or "")[:200],
                     "error": error,
                 }
@@ -366,18 +187,13 @@ def report(configs):
             "total_p50": percentile([r["retrieval_ms"] + r["generation_ms"] for r in records], 0.50),
         }
 
+    label = rag_core.MODE_LABEL
     lines = ["# 评测结果", "",
              "评测集：`eval/goldens.json` 里 gradeable 的官方单选题（答案键取自规则书第 6 章）。",
-             "评测脚本：`python eval/run_eval.py`（结果按题增量落盘，可中断续跑）。", "",
+             "评测脚本：`python eval/run_eval.py`（结果按题增量落盘，可中断续跑）。",
+             "检索与提示词来自 `rag_core.py`，与 `query_rag.py` 共用同一份实现。", "",
              "| 配置 | 题数 | 准确率 | 正确/总数 | 检索 P50 | 检索 P95 | 生成 P50 | 端到端 P50 |",
              "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"]
-    label = {
-        "closed_book": "闭卷（无检索·基线）",
-        "vector": "纯向量 top3",
-        "vector_deep": "纯向量 top8",
-        "vector_rerank": "向量20 + rerank3",
-        "hybrid": "BM25+向量融合 top3",
-    }
     for config in sorted(rows, key=lambda name: order_of.get(name, 99)):
         row = rows[config]
         lines.append("| %s | %d | **%.1f%%** | %d/%d | %.0f ms | %.0f ms | %.0f ms | %.0f ms |" % (
